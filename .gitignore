@@ -12,3 +12,6 @@ benchmarks/
 
 *.ipynb
 *.log
+
+mlruns/
+mlflow.db
