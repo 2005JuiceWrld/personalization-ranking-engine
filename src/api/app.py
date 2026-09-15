@@ -16,6 +16,7 @@ pipeline = RecommendationPipeline()
 class RecommendationRequest(BaseModel):
     visitorid: int
     k: int = Field(default=10, ge=1, le=100)
+    query: str | None = None
 
 
 @app.get("/health")
@@ -32,6 +33,7 @@ def recommend(request: RecommendationRequest):
         recommendations = pipeline.recommend(
             visitorid=request.visitorid,
             k=request.k,
+            query=request.query,
         )
 
         return {

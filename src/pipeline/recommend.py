@@ -14,6 +14,7 @@ from src.features.session_features import (
     build_session_affinity,
     normalize_session_affinity,
 )
+from src.retrieval.bm25 import BM25Retriever, reciprocal_rank_fusion
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -228,6 +229,7 @@ class RecommendationPipeline:
         )
 
         self.online_features = OnlineFeatureStore()
+        self.bm25 = BM25Retriever()
 
         print("Pipeline loaded.")
 
@@ -245,6 +247,7 @@ class RecommendationPipeline:
     def _retrieve_candidates(
         self,
         visitorid: int,
+        query: str | None = None,
     ):
 
         user_vector = self._get_user_vector(
@@ -254,25 +257,22 @@ class RecommendationPipeline:
         if user_vector is None:
             return pd.DataFrame()
 
-        scores, indices = self.index.search(
+        semantic_scores, semantic_indices = self.index.search(
             user_vector,
             self.candidate_k,
         )
 
-        rows = []
+        semantic_items = []
 
         seen_items = self.user_items.get(
             visitorid,
             set(),
         )
 
-        rank = 1
-
         for score, index in zip(
-            scores[0],
-            indices[0],
+            semantic_scores[0],
+            semantic_indices[0],
         ):
-
             if index < 0:
                 continue
 
@@ -283,16 +283,69 @@ class RecommendationPipeline:
             if itemid in seen_items:
                 continue
 
-            rows.append(
+            semantic_items.append(
                 {
-                    "visitorid": visitorid,
                     "itemid": itemid,
                     "retrieval_score": float(score),
-                    "retrieval_rank": rank,
                 }
             )
 
-            rank += 1
+        if query and query.strip():
+            lexical_items = self.bm25.search(
+                query,
+                self.candidate_k * 3,
+            )
+
+            lexical_items = [
+                item
+                for item in lexical_items
+                if (
+                    item["itemid"] not in seen_items
+                    and item["itemid"] in self.item_to_embedding
+                )
+            ]
+
+            fused = reciprocal_rank_fusion(
+                semantic_items,
+                lexical_items,
+                k=self.candidate_k,
+            )
+
+            rows = []
+
+            for rank, item in enumerate(
+                fused,
+                start=1,
+            ):
+                itemid = int(item["itemid"])
+
+                rows.append(
+                    {
+                        "visitorid": visitorid,
+                        "itemid": itemid,
+                        "retrieval_score": float(
+                            item["rrf_score"]
+                        ),
+                        "retrieval_rank": rank,
+                    }
+                )
+
+            return pd.DataFrame(rows)
+
+        rows = []
+
+        for rank, item in enumerate(
+            semantic_items,
+            start=1,
+        ):
+            rows.append(
+                {
+                    "visitorid": visitorid,
+                    "itemid": item["itemid"],
+                    "retrieval_score": item["retrieval_score"],
+                    "retrieval_rank": rank,
+                }
+            )
 
         return pd.DataFrame(rows)
 
@@ -454,6 +507,7 @@ class RecommendationPipeline:
         self,
         visitorid: int,
         k: int = 10,
+        query: str | None = None,
     ):
 
         # Cold-start fallback for unknown users.
@@ -468,7 +522,8 @@ class RecommendationPipeline:
             ]
 
         candidates = self._retrieve_candidates(
-            visitorid
+            visitorid,
+            query=query,
         )
 
         if candidates.empty:
