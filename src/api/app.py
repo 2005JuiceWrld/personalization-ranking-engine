@@ -1,6 +1,14 @@
-from fastapi import FastAPI, HTTPException
+import time
+
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 
+from src.api.metrics import (
+    RECOMMENDATION_LATENCY,
+    RECOMMENDATION_REQUESTS,
+    RECOMMENDATION_RESULTS,
+    metrics_response,
+)
 from src.pipeline.recommend import RecommendationPipeline
 
 
@@ -8,7 +16,6 @@ app = FastAPI(
     title="Personalization & Ranking Intelligence Engine",
     version="1.0.0",
 )
-
 
 pipeline = RecommendationPipeline()
 
@@ -27,8 +34,20 @@ def health():
     }
 
 
+@app.get("/metrics")
+def metrics():
+    body, content_type = metrics_response()
+    return Response(
+        content=body,
+        media_type=content_type,
+    )
+
+
 @app.post("/recommend")
 def recommend(request: RecommendationRequest):
+    endpoint = "/recommend"
+    start_time = time.perf_counter()
+
     try:
         recommendations = pipeline.recommend(
             visitorid=request.visitorid,
@@ -36,13 +55,38 @@ def recommend(request: RecommendationRequest):
             query=request.query,
         )
 
+        RECOMMENDATION_REQUESTS.labels(
+            endpoint=endpoint,
+            status="200",
+        ).inc()
+
+        RECOMMENDATION_RESULTS.observe(len(recommendations))
+
         return {
             "visitorid": request.visitorid,
             "recommendations": recommendations,
         }
 
     except ValueError as exc:
+        RECOMMENDATION_REQUESTS.labels(
+            endpoint=endpoint,
+            status="404",
+        ).inc()
+
         raise HTTPException(
             status_code=404,
             detail=str(exc),
         )
+
+    except Exception:
+        RECOMMENDATION_REQUESTS.labels(
+            endpoint=endpoint,
+            status="500",
+        ).inc()
+
+        raise
+
+    finally:
+        RECOMMENDATION_LATENCY.labels(
+            endpoint=endpoint,
+        ).observe(time.perf_counter() - start_time)
