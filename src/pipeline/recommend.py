@@ -9,6 +9,11 @@ import pandas as pd
 import torch
 
 from src.models.two_tower import TwoTowerModel, EMBEDDING_DIM
+from src.streaming.online_features import OnlineFeatureStore
+from src.features.session_features import (
+    build_session_affinity,
+    normalize_session_affinity,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -221,6 +226,8 @@ class RecommendationPipeline:
             .apply(set)
             .to_dict()
         )
+
+        self.online_features = OnlineFeatureStore()
 
         print("Pipeline loaded.")
 
@@ -477,15 +484,80 @@ class RecommendationPipeline:
             )
         )
 
+        # ---------------------------------------------------------
+        # Online session affinity
+        # ---------------------------------------------------------
+
+        online = self.online_features.get_user_features(
+            visitorid
+        )
+
+        recent_item_ids = [
+            int(itemid)
+            for itemid in online["recent_items"]
+            if int(itemid) in self.item_to_embedding
+        ]
+
+        if recent_item_ids:
+
+            recent_item_embeddings = np.asarray(
+                [
+                    self.item_to_embedding[itemid]
+                    for itemid in recent_item_ids
+                ],
+                dtype=np.float32,
+            )
+
+            candidate_embeddings = np.asarray(
+                [
+                    self.item_to_embedding[int(itemid)]
+                    for itemid in candidates["itemid"]
+                ],
+                dtype=np.float32,
+            )
+
+            session_affinity = build_session_affinity(
+                candidate_embeddings,
+                recent_item_embeddings,
+            )
+
+            session_affinity = normalize_session_affinity(
+                session_affinity
+            )
+
+            features["session_affinity"] = (
+                session_affinity
+            )
+
+        else:
+
+            features["session_affinity"] = 0.0
+
+        # ---------------------------------------------------------
+        # Controlled online session adjustment
+        # ---------------------------------------------------------
+
+        SESSION_WEIGHT = 0.15
+
+        features["personalized_score"] = (
+            features["ltr_score"]
+            + SESSION_WEIGHT
+            * features["session_affinity"]
+        )
+
         # Keep a larger ranked pool before diversification.
         diversification_pool = (
             features
             .sort_values(
-                "ltr_score",
+                "personalized_score",
                 ascending=False,
             )
-            .head(min(k, len(features)))
-            .reset_index(drop=True)
+            .head(
+                min(k, len(features))
+            )
+            .reset_index(
+                drop=True
+            )
         )
 
         # Map candidate item IDs to their Two-Tower embeddings.
@@ -499,11 +571,36 @@ class RecommendationPipeline:
 
         diversified = mmr_select(
             item_ids=diversification_pool["itemid"].tolist(),
-            relevance_scores=diversification_pool["ltr_score"].to_numpy(),
+            relevance_scores=diversification_pool["personalized_score"].to_numpy(),
             item_embeddings=item_embeddings,
             k=k,
             diversity_weight=0.2,
         )
+
+        # Restore the original LightGBM score and expose
+        # the online personalization signal separately.
+        score_lookup = (
+            diversification_pool
+            .set_index("itemid")
+            [["ltr_score", "session_affinity", "personalized_score"]]
+            .to_dict("index")
+        )
+
+        for recommendation in diversified:
+            itemid = recommendation["itemid"]
+            scores = score_lookup[itemid]
+
+            recommendation["ltr_score"] = float(
+                scores["ltr_score"]
+            )
+
+            recommendation["session_affinity"] = float(
+                scores["session_affinity"]
+            )
+
+            recommendation["personalized_score"] = float(
+                scores["personalized_score"]
+            )
 
         return diversified
 
