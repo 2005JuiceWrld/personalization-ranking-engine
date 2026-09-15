@@ -14,6 +14,10 @@ from src.features.session_features import (
     build_session_affinity,
     normalize_session_affinity,
 )
+from src.features.item_representation import (
+    build_category_affinity,
+    normalize_category_affinity,
+)
 from src.retrieval.bm25 import BM25Retriever, reciprocal_rank_fusion
 
 
@@ -27,6 +31,7 @@ ITEM_MAP_PATH = MODEL_DIR / "two_tower_item_mapping.csv"
 
 FAISS_INDEX_PATH = MODEL_DIR / "two_tower_items_hnsw.faiss"
 LTR_MODEL_PATH = MODEL_DIR / "lightgbm_ranker.txt"
+CATEGORY_EMBEDDING_PATH = MODEL_DIR / "item_category_embedding_temporal.npy"
 POPULARITY_PATH = MODEL_DIR / "popularity.csv"
 
 USER_FEATURES_PATH = FEATURE_DIR / "user_features.csv"
@@ -124,6 +129,21 @@ class RecommendationPipeline:
                 self.index_to_item
             )
         }
+        # ---------------------------------------------------------
+        # Temporal category representation
+        # ---------------------------------------------------------
+
+        self.category_embeddings = np.load(
+            CATEGORY_EMBEDDING_PATH
+        ).astype("float32")
+
+        self.item_to_category_embedding = {
+            int(itemid): self.category_embeddings[index]
+            for index, itemid in enumerate(
+                self.index_to_item
+            )
+        }
+
         # ---------------------------------------------------------
         # HNSW index
         # ---------------------------------------------------------
@@ -589,13 +609,53 @@ class RecommendationPipeline:
             features["session_affinity"] = 0.0
 
         # ---------------------------------------------------------
-        # Controlled online session adjustment
+        # Temporal category affinity
         # ---------------------------------------------------------
 
+        if recent_item_ids:
+
+            recent_category_embeddings = np.asarray(
+                [
+                    self.item_to_category_embedding[itemid]
+                    for itemid in recent_item_ids
+                ],
+                dtype=np.float32,
+            )
+
+            candidate_category_embeddings = np.asarray(
+                [
+                    self.item_to_category_embedding[int(itemid)]
+                    for itemid in candidates["itemid"]
+                ],
+                dtype=np.float32,
+            )
+
+            category_affinity = build_category_affinity(
+                candidate_category_embeddings,
+                recent_category_embeddings,
+            )
+
+            category_affinity = normalize_category_affinity(
+                category_affinity
+            )
+
+            features["category_affinity"] = category_affinity
+
+        else:
+
+            features["category_affinity"] = 0.0
+
+        # ---------------------------------------------------------
+        # Controlled personalization adjustment
+        # ---------------------------------------------------------
+
+        CATEGORY_WEIGHT = 4.0
         SESSION_WEIGHT = 0.15
 
         features["personalized_score"] = (
             features["ltr_score"]
+            + CATEGORY_WEIGHT
+            * features["category_affinity"]
             + SESSION_WEIGHT
             * features["session_affinity"]
         )
@@ -637,7 +697,7 @@ class RecommendationPipeline:
         score_lookup = (
             diversification_pool
             .set_index("itemid")
-            [["ltr_score", "session_affinity", "personalized_score"]]
+            [["ltr_score", "category_affinity", "session_affinity", "personalized_score"]]
             .to_dict("index")
         )
 
@@ -647,6 +707,10 @@ class RecommendationPipeline:
 
             recommendation["ltr_score"] = float(
                 scores["ltr_score"]
+            )
+
+            recommendation["category_affinity"] = float(
+                scores["category_affinity"]
             )
 
             recommendation["session_affinity"] = float(
