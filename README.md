@@ -1,1014 +1,972 @@
-\# Real-Time Personalization, Search \& Ranking Intelligence Engine
+# Real-Time Personalization, Search & Ranking Intelligence Engine
 
+A production-oriented recommendation and ranking platform that combines **deep retrieval, hybrid search, learning-to-rank, real-time behavioral features, session personalization, category affinity, and diversity optimization**.
 
-
-An end-to-end recommendation and ranking system designed around a production-style retrieval → ranking → diversification architecture.
-
-
-
-The system combines implicit-feedback modeling, Two-Tower retrieval, approximate nearest-neighbor search, LightGBM learning-to-rank, MMR-based diversification, cold-start handling, and FastAPI serving.
-
-
-
-\## System Architecture
-
-
+The system is designed around a realistic recommendation architecture:
 
 ```text
+                         ┌──────────────────────┐
+                         │    User / Client     │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │      FastAPI API     │
+                         └──────────┬───────────┘
+                                    │
+                    ┌───────────────┴────────────────┐
+                    │                                │
+                    ▼                                ▼
+             Redis Online Features             Request Context
+                    │                                │
+                    └───────────────┬────────────────┘
+                                    ▼
+                         ┌──────────────────────┐
+                         │ Candidate Retrieval  │
+                         └──────────┬───────────┘
+                                    │
+                 ┌──────────────────┼──────────────────┐
+                 │                  │                  │
+                 ▼                  ▼                  ▼
+          Two-Tower + HNSW       BM25             Behavioral /
+          Semantic Retrieval     Lexical           Retrieval Signals
+                 │                  │                  │
+                 └──────────┬───────┴──────────────────┘
+                            ▼
+                     RRF Candidate Fusion
+                            │
+                            ▼
+                  LightGBM LambdaRank
+                            │
+                            ▼
+              Session + Category Personalization
+                            │
+                            ▼
+                    MMR Diversification
+                            │
+                            ▼
+                         Top-N
+                            │
+                            ▼
+                       FastAPI Response
 
-User / Visitor
+Streaming Path:
 
-&#x20;     │
+User Events → Kafka → Feature Consumer → Redis
+                                      │
+                                      └──► Online Features
 
-&#x20;     ▼
+Observability:
 
-Two-Tower User Embedding
-
-&#x20;     │
-
-&#x20;     ▼
-
-HNSW Approximate Nearest Neighbor Search
-
-&#x20;     │
-
-&#x20;     │  Top-100 candidates
-
-&#x20;     ▼
-
-Feature Engineering
-
-&#x20;     │
-
-&#x20;     ▼
-
-LightGBM LambdaRank
-
-&#x20;     │
-
-&#x20;     ▼
-
-MMR Diversification
-
-&#x20;     │
-
-&#x20;     ▼
-
-Top-N Recommendations
-
-&#x20;     │
-
-&#x20;     ▼
-
-FastAPI
-
+FastAPI → Prometheus
+ML Experiments → MLflow
 ```
 
+---
 
+## 1. Problem
 
-For unknown users, the system bypasses personalized retrieval and uses a popularity-based fallback.
+Large recommendation systems must solve several problems simultaneously:
 
+* retrieve relevant candidates from a large item universe
+* incorporate historical user behavior
+* react to recent user activity
+* combine multiple retrieval strategies
+* rank candidates using behavioral signals
+* personalize recommendations by session and category
+* avoid repetitive recommendations
+* maintain low serving latency
+* support real-time feature updates
+* monitor the production API
 
+A single recommendation model is insufficient for these requirements.
 
-\## Problem
+This project therefore implements a **multi-stage retrieval and ranking architecture** rather than treating recommendation as a single prediction problem.
 
+---
 
+# 2. System Architecture
 
-A recommendation system must balance several competing requirements:
+## Offline ML Pipeline
 
+```text
+RetailRocket Events
+        │
+        ▼
+Data Validation
+        │
+        ▼
+Temporal Train / Validation / Test Split
+        │
+        ├──────────────► Popularity Baseline
+        │
+        ├──────────────► Implicit Collaborative Filtering
+        │
+        ├──────────────► Two-Tower Retrieval
+        │                       │
+        │                       ▼
+        │                  FAISS HNSW
+        │
+        ├──────────────► BM25 Attribute Retrieval
+        │
+        └──────────────► Category Representation
+                                │
+                                ▼
+                         Temporal SVD Embedding
 
+Candidate Retrieval
+        │
+        ▼
+Candidate Fusion / RRF
+        │
+        ▼
+Ranking Feature Generation
+        │
+        ▼
+LightGBM LambdaRank
+        │
+        ▼
+Offline Evaluation
+```
 
-\* retrieve relevant items from a large catalog
+## Online Serving Pipeline
 
-\* personalize results from sparse implicit feedback
+```text
+Request
+  │
+  ├── visitorid
+  ├── k
+  └── optional query/context
+  │
+  ▼
+FastAPI
+  │
+  ▼
+Online Feature Store ──► Redis
+  │
+  ├── recent items
+  ├── event counts
+  ├── behavior score
+  └── last event timestamp
+  │
+  ▼
+Candidate Generation
+  │
+  ├── Two-Tower / HNSW
+  └── BM25 + RRF
+  │
+  ▼
+LightGBM Ranker
+  │
+  ▼
+Personalization
+  │
+  ├── Category affinity
+  └── Session affinity
+  │
+  ▼
+MMR Diversification
+  │
+  ▼
+Top-N Recommendations
+```
 
-\* rank candidates using contextual features
+---
 
-\* keep retrieval latency low
+# 3. Dataset
 
-\* avoid overly repetitive recommendations
+The project uses the **RetailRocket recommender dataset**.
 
-\* handle users with no historical interactions
+Approximate scale:
 
-\* expose the model through a production-style API
-
-
-
-This project implements those components as separate stages rather than treating recommendation as a single model.
-
-
-
-\## Dataset
-
-
-
-The system was developed using the \*\*RetailRocket e-commerce dataset\*\*.
-
-
-
-Original event statistics:
-
-
-
-\* 2.76M+ events
-
-\* 1.4M+ users
-
-\* 235K+ items
-
-\* event types: view, add-to-cart, transaction
-
-
+| Component                     |     Scale |
+| ----------------------------- | --------: |
+| Events                        |    ~2.76M |
+| Users                         |     ~1.4M |
+| Items                         |     ~235K |
+| Two-Tower users               | 1,123,765 |
+| Two-Tower items               |   212,915 |
+| Retrieval embedding dimension |        64 |
 
 Interaction weights:
 
-
-
 ```text
-
-view         = 1
-
-add-to-cart  = 3
-
-transaction  = 10
-
+view         → 1
+addtocart    → 3
+transaction  → 10
 ```
 
-
-
-The event data was cleaned and split chronologically:
-
-
+A strict temporal split was used:
 
 ```text
-
-80% Train
-
-10% Validation
-
-10% Test
-
+Train
+  ↓
+Validation
+  ↓
+Test
 ```
 
+The test period is strictly later than the training period.
 
+This is important because recommendation evaluation can easily become invalid if future interactions leak into candidate generation or user features.
 
-This preserves temporal ordering and avoids randomly mixing future interactions into training data.
+---
 
+# 4. Retrieval System
 
+## Two-Tower Retrieval
 
-\## Retrieval Models
-
-
-
-The project implements multiple recommendation approaches for comparison.
-
-
-
-\### Popularity
-
-
-
-A weighted interaction-frequency baseline.
-
-
-
-\### Content-Based
-
-
-
-Builds user preferences from product category information.
-
-
-
-\### Collaborative Filtering
-
-
-
-Uses implicit user-item interactions with truncated SVD representations.
-
-
-
-\### Two-Tower Retrieval
-
-
-
-A neural retrieval model learns separate user and item embeddings.
-
-
+A two-tower neural architecture learns separate representations for users and items.
 
 ```text
-
-User features ──► User Tower ──► User Embedding
-
-&#x20;                                     │
-
-&#x20;                                     ▼
-
-&#x20;                                 Similarity
-
-&#x20;                                     ▲
-
-&#x20;                                     │
-
-Item features ──► Item Tower ──► Item Embedding
-
+User Features ──► User Tower ──► 64D User Embedding
+                                      │
+                                      │ similarity
+                                      ▼
+Item Features ──► Item Tower ──► 64D Item Embedding
 ```
 
+Training uses implicit interaction data with sampled negative items.
 
-
-The Two-Tower model uses 64-dimensional embeddings and is trained with implicit positive interactions and sampled negatives.
-
-
-
-\## ANN Retrieval
-
-
-
-Two ANN implementations were evaluated:
-
-
-
-\* FAISS exact inner-product search
-
-\* FAISS HNSW approximate search
-
-
-
-HNSW configuration:
-
-
+Configuration:
 
 ```text
-
-M = 32
-
-efConstruction = 200
-
-efSearch = 128
-
+Framework:       PyTorch
+Embedding dim:   64
+Loss:             BCEWithLogitsLoss
+Optimizer:        Adam
+Batch size:       4096
+Epochs:           3
+Negative samples: 2 / positive
 ```
 
+The trained item embeddings are indexed using FAISS.
 
+---
 
-Measured local benchmark:
+# 5. FAISS Retrieval
 
+Two FAISS configurations were evaluated.
 
+### Exact Search
 
 ```text
-
-Exact search:
-
-\~1.254 ms/query
-
-
-
-HNSW:
-
-\~0.084 ms/query
-
-
-
-Top-10 neighbor agreement:
-
-97.66%
-
+IndexFlatIP
 ```
 
-
-
-This corresponds to approximately \*\*14.9× lower measured retrieval latency\*\* in the benchmark.
-
-
-
-> The 97.66% figure is ANN neighbor recall against exact search. It is not the recommendation-system Recall@10 metric.
-
-
-
-\## Learning-to-Rank
-
-
-
-Retrieved candidates are passed to a LightGBM LambdaRank model.
-
-
-
-Features include:
-
-
-
-\### User features
-
-
-
-\* interaction count
-
-\* unique items
-
-\* total interaction weight
-
-\* transaction count
-
-
-
-\### Item features
-
-
-
-\* interaction count
-
-\* unique users
-
-\* total interaction weight
-
-\* transaction count
-
-
-
-\### User-item features
-
-
-
-\* historical interactions
-
-\* interaction weight
-
-\* transaction count
-
-\* recency
-
-
-
-\### Retrieval features
-
-
-
-\* retrieval score
-
-\* retrieval rank
-
-
-
-The ranking model is trained separately from the final temporal test evaluation.
-
-
-
-\## Diversification
-
-
-
-After ranking, MMR-style diversification is applied to reduce repetitive results.
-
-
-
-The pipeline therefore separates:
-
-
+Measured approximately:
 
 ```text
-
-Relevance
-
-&#x20;  ↓
-
-Ranking
-
-&#x20;  ↓
-
-Diversification
-
+~1.25 ms/query
 ```
 
-
-
-The API exposes the resulting normalized relevance component as `mmr\_score`.
-
-
-
-\## Evaluation
-
-
-
-Baseline evaluation on the held-out recommendation task:
-
-
-
-| Model                   | Recall@10 | HitRate@10 |  NDCG@10 |
-
-| ----------------------- | --------: | ---------: | -------: |
-
-| Popularity              |  0.006824 |   0.007708 | 0.003548 |
-
-| Content-Based           |  0.001875 |   0.002892 | 0.000942 |
-
-| Collaborative Filtering |  0.001686 |   0.004056 | 0.001285 |
-
-| Two-Tower               |  0.002123 |   0.004143 | 0.001246 |
-
-
-
-The sparse dataset makes personalization difficult. Popularity remains a strong baseline, while Two-Tower retrieval improves over content-based retrieval on the reported Recall@10 and HitRate@10 metrics.
-
-
-
-\### Held-Out Temporal Ranking Evaluation
-
-
-
-Using a separate temporal test set:
-
-
+### Approximate Search
 
 ```text
-
-Retrieval only
-
-
-
-Recall@10   0.247133
-
-HitRate@10  0.279570
-
-NDCG@10     0.125327
-
-```
-
-
-
-With HNSW retrieval + LightGBM reranking:
-
-
-
-```text
-
-Recall@10   0.240860
-
-HitRate@10  0.284946
-
-NDCG@10     0.149167
-
-```
-
-
-
-The reranker therefore improved NDCG while slightly reducing Recall@10 on the evaluated subset.
-
-
-
-\*\*Important limitation:\*\* the final ranking evaluation used a relatively small processed evaluation subset, so these results should be interpreted as an engineering validation rather than a statistically definitive production result.
-
-
-
-An earlier experiment trained and evaluated on the same validation labels and produced artificially high metrics. That experiment was identified as label leakage and is \*\*not used as a project result\*\*.
-
-
-
-\## End-to-End Performance
-
-
-
-Local CPU benchmark:
-
-
-
-```text
-
-Queries:       100
-
-Average/query: \~4.882 ms
-
-Throughput:    \~204.83 QPS
-
-```
-
-
-
-This is a local benchmark of the in-process pipeline and should not be interpreted as production capacity.
-
-
-
-The main optimized serving path is:
-
-
-
-```text
-
-Two-Tower
-
-&#x20;   ↓
-
 HNSW
-
-&#x20;   ↓
-
-100 candidates
-
-&#x20;   ↓
-
-Feature lookup
-
-&#x20;   ↓
-
-LightGBM
-
-&#x20;   ↓
-
-MMR
-
-&#x20;   ↓
-
-Top-N
-
+M = 32
+efConstruction = 200
+efSearch = 128
 ```
 
-
-
-\## API
-
-
-
-FastAPI exposes:
-
-
+Measured approximately:
 
 ```text
-
-GET  /health
-
-POST /recommend
-
-GET  /docs
-
+~0.084 ms/query
 ```
 
+The measured HNSW neighbor agreement at `efSearch=128` was approximately:
 
+```text
+97.66%
+```
+
+This benchmark measures retrieval-neighbor agreement, not end-to-end recommendation quality.
+
+---
+
+# 6. Hybrid Retrieval
+
+The system combines semantic retrieval with lexical/attribute retrieval.
+
+## Semantic Retrieval
+
+Two-Tower embeddings provide the primary semantic retrieval mechanism.
+
+## BM25 Retrieval
+
+The dataset does not contain rich natural-language product descriptions, so BM25 is used as an **attribute/category-oriented lexical retrieval layer**.
+
+Indexed metadata includes product properties and category information.
+
+## Reciprocal Rank Fusion
+
+Candidate lists can be combined using Reciprocal Rank Fusion:
+
+```text
+RRF score = Σ 1 / (k + rank)
+```
+
+This allows candidates supported by different retrieval strategies to enter the ranking stage without requiring their raw scores to be directly comparable.
+
+---
+
+# 7. Learning-to-Rank
+
+Candidate features are generated from user, item, and user-item interaction history.
+
+The ranking model is:
+
+```text
+LightGBM LambdaRank
+```
+
+Configuration:
+
+```text
+n_estimators       = 300
+learning_rate      = 0.05
+num_leaves         = 31
+min_child_samples  = 50
+subsample           = 0.8
+colsample_bytree    = 0.8
+reg_alpha           = 0.1
+reg_lambda          = 1
+```
+
+Ranking features include:
+
+* retrieval score
+* retrieval rank
+* user interaction count
+* unique items interacted with
+* total interaction weight
+* transaction count
+* item interaction count
+* unique users per item
+* item interaction weight
+* item transaction count
+* user-item interaction count
+* user-item interaction weight
+* user-item transaction count
+* user-item recency
+
+---
+
+# 8. Session Personalization
+
+Recent user interactions are converted into a session affinity signal.
+
+The system compares candidate item embeddings against recently interacted item embeddings.
+
+The resulting session affinity captures short-term intent that may differ from long-term user behavior.
+
+```text
+Recent User Items
+        │
+        ▼
+Item Embeddings
+        │
+        ▼
+Candidate Similarity
+        │
+        ▼
+Session Affinity
+```
+
+---
+
+# 9. Category-Aware Personalization
+
+Because the dataset contains category metadata but limited natural-language product information, category representation is used as an additional personalization signal.
+
+Category paths are converted into a sparse item-category matrix and reduced using SVD.
+
+Temporal construction prevents future metadata from entering the representation used for evaluation.
+
+Configuration:
+
+```text
+Category embedding dimension: 32
+Temporal vocabulary:           1,488 categories
+Item universe:                 212,915
+```
+
+The selected category personalization weight was determined through offline validation.
+
+The final production scoring structure is:
+
+```text
+personalized_score =
+    ltr_score
+    + 4.0 × category_affinity
+    + 0.15 × session_affinity
+```
+
+---
+
+# 10. Diversity Optimization
+
+The ranking stage can produce highly similar recommendations.
+
+Maximum Marginal Relevance (MMR) is therefore applied after personalization to balance:
+
+```text
+Relevance
+    +
+Diversity
+```
+
+This reduces redundant recommendations while preserving high-scoring candidates.
+
+---
+
+# 11. Offline Evaluation
+
+Evaluation was performed using a temporal test period rather than random splitting.
+
+The evaluation pipeline:
+
+```text
+Historical interactions
+        │
+        ▼
+Candidate Retrieval
+        │
+        ▼
+Seen-item filtering
+        │
+        ▼
+Test-period positives
+        │
+        ▼
+Ranking
+        │
+        ▼
+Recall@10
+HitRate@10
+NDCG@10
+```
+
+### Stage 5 Category Personalization
+
+The selected configuration produced:
+
+| Metric     |      Score |
+| ---------- | ---------: |
+| Recall@10  | **0.4475** |
+| HitRate@10 | **0.4785** |
+| NDCG@10    | **0.2676** |
+
+Compared with the existing LightGBM ranking baseline:
+
+```text
+Recall@10:  +0.2067
+HitRate@10: +0.1935
+NDCG@10:    +0.1185
+```
+
+The evaluation contained a relatively small number of positive test labels, so these measurements should be interpreted as offline experimental results rather than production-level statistical guarantees.
+
+---
+
+# 12. Retrieval Baselines
+
+Initial retrieval experiments established reference points.
+
+| Retriever     | Recall@10 | HitRate@10 |  NDCG@10 |
+| ------------- | --------: | ---------: | -------: |
+| Popularity    |  0.006824 |   0.007708 | 0.003548 |
+| Content-based |  0.001875 |   0.002892 | 0.000942 |
+| Two-Tower     |  0.002123 |   0.004143 | 0.001246 |
+
+These baseline results demonstrate why the project uses a **multi-stage ranking architecture** rather than relying on a single retrieval model.
+
+---
+
+# 13. Real-Time Feature Pipeline
+
+The online feature system uses Kafka and Redis.
+
+```text
+Interaction Event
+       │
+       ▼
+     Kafka
+       │
+       ▼
+Feature Consumer
+       │
+       ▼
+     Redis
+       │
+       ├── recent_items
+       ├── event_counts
+       ├── behavior_score
+       └── last_event_ts
+```
+
+Kafka topic:
+
+```text
+interaction-events
+```
+
+The feature consumer updates Redis immediately after receiving events.
+
+This allows recommendation requests to incorporate recent behavior without rebuilding the offline feature dataset.
+
+---
+
+# 14. API
+
+The recommendation service is implemented with FastAPI.
+
+Primary endpoints:
+
+```text
+GET  /health
+POST /recommend
+GET  /metrics
+```
 
 Example request:
 
-
-
 ```json
-
 {
-
-&#x20; "visitorid": 1,
-
-&#x20; "k": 10
-
+  "visitorid": 1,
+  "k": 10
 }
-
 ```
 
-
-
-Example response:
-
-
-
-```json
-
-{
-
-&#x20; "visitorid": 1,
-
-&#x20; "recommendations": \[
-
-&#x20;   {
-
-&#x20;     "itemid": 344071,
-
-&#x20;     "ltr\_score": 1.192949891090393,
-
-&#x20;     "mmr\_score": 1.0
-
-&#x20;   }
-
-&#x20; ]
-
-}
-
-```
-
-
-
-The API validates:
-
-
+The recommendation response exposes ranking and personalization signals, including:
 
 ```text
-
-1 <= k <= 100
-
+itemid
+ltr_score
+mmr_score
+category_affinity
+session_affinity
+personalized_score
 ```
 
+---
 
+# 15. Observability
 
-Unknown users are handled through the popularity fallback.
-
-
-
-\## Docker Deployment
-
-
-
-The inference service is containerized using:
-
-
+Prometheus instrumentation tracks:
 
 ```text
-
-Python 3.12
-
-FastAPI
-
-Uvicorn
-
-PyTorch
-
-FAISS
-
-LightGBM
-
+recommendation_requests_total
+recommendation_latency_seconds
+recommendation_results_count
 ```
 
-
-
-The Docker image contains only the artifacts required for inference.
-
-
-
-Build:
-
-
-
-```bash
-
-docker build -t personalization-ranking-engine:1.0 .
-
-```
-
-
-
-Run:
-
-
-
-```bash
-
-docker run -d \\
-
-&#x20; --name personalization-ranking-engine \\
-
-&#x20; -p 8000:8000 \\
-
-&#x20; personalization-ranking-engine:1.0
-
-```
-
-
-
-Health check:
-
-
-
-```bash
-
-curl http://127.0.0.1:8000/health
-
-```
-
-
-
-The container was validated against the local API and produced identical recommendation IDs, ordering, LTR scores, and MMR scores for the same request.
-
-
-
-\## Project Structure
-
-
+Metrics are exposed through:
 
 ```text
-
-personalization-ranking-engine/
-
-│
-
-├── src/
-
-│   ├── api/
-
-│   │   └── app.py
-
-│   │
-
-│   ├── data/
-
-│   │   ├── prepare\_data.py
-
-│   │   └── prepare\_items.py
-
-│   │
-
-│   ├── evaluation/
-
-│   │   ├── metrics.py
-
-│   │   ├── evaluate\_popularity.py
-
-│   │   ├── evaluate\_content\_based.py
-
-│   │   ├── evaluate\_cf.py
-
-│   │   ├── evaluate\_two\_tower.py
-
-│   │   └── evaluate\_ltr\_test.py
-
-│   │
-
-│   ├── features/
-
-│   │   └── ranking\_features.py
-
-│   │
-
-│   ├── models/
-
-│   │   ├── popularity.py
-
-│   │   ├── content\_based.py
-
-│   │   ├── collaborative\_filtering.py
-
-│   │   ├── two\_tower.py
-
-│   │   └── two\_tower\_recommender.py
-
-│   │
-
-│   ├── pipeline/
-
-│   │   ├── recommend.py
-
-│   │   ├── benchmark\_pipeline.py
-
-│   │   └── profile\_pipeline.py
-
-│   │
-
-│   ├── ranking/
-
-│   │   ├── build\_ranking\_dataset.py
-
-│   │   ├── build\_ltr\_test\_dataset.py
-
-│   │   └── train\_ltr.py
-
-│   │
-
-│   └── retrieval/
-
-│       ├── build\_faiss\_index.py
-
-│       ├── build\_hnsw\_index.py
-
-│       ├── benchmark\_hnsw.py
-
-│       └── diversification.py
-
-│
-
-├── tests/
-
-│   └── test\_api.py
-
-│
-
-├── Dockerfile
-
-├── .dockerignore
-
-├── .gitignore
-
-├── requirements.txt
-
-└── README.md
-
+/metrics
 ```
 
+Prometheus continuously scrapes the API.
 
+This enables monitoring of:
 
-\## Testing
+* request volume
+* HTTP status distribution
+* latency
+* recommendation result counts
 
+---
 
+# 16. MLflow
 
-FastAPI integration tests cover:
+MLflow is used to track Two-Tower training experiments.
 
-
-
-\* health endpoint
-
-\* known-user recommendations
-
-\* unknown-user cold start
-
-\* invalid `k` below minimum
-
-\* invalid `k` above maximum
-
-\* maximum `k=100`
-
-
-
-Current result:
-
-
+Tracked information includes:
 
 ```text
-
-6 passed
-
+training parameters
+epoch losses
+training sample count
+model artifact
+user mapping
+item mapping
 ```
 
-
-
-\## Engineering Decisions
-
-
-
-\### Why Two-Stage Retrieval + Ranking?
-
-
-
-Running a complex ranking model over the entire catalog is expensive.
-
-
-
-Instead:
-
-
+Tracking backend:
 
 ```text
-
-Large catalog
-
-&#x20;   ↓
-
-Fast retrieval
-
-&#x20;   ↓
-
-Small candidate set
-
-&#x20;   ↓
-
-Expensive ranking
-
+SQLite
 ```
 
+This provides reproducibility for model-training experiments.
 
+---
 
-This allows more sophisticated ranking while keeping inference practical.
+# 17. Docker Deployment
 
-
-
-\### Why HNSW?
-
-
-
-Exact nearest-neighbor search provides a useful correctness baseline, while HNSW provides a latency/recall tradeoff suitable for large-scale retrieval.
-
-
-
-\### Why a Popularity Fallback?
-
-
-
-New or anonymous users may have no historical representation. A deterministic popularity model provides a safe fallback instead of returning an error or attempting meaningless personalization.
-
-
-
-\### Why Temporal Evaluation?
-
-
-
-Recommendation systems operate in time. A chronological train/validation/test split provides a more realistic evaluation than randomly mixing future interactions into training data.
-
-
-
-\## Limitations
-
-
-
-The RetailRocket dataset is highly sparse and provides limited product metadata.
-
-
-
-Consequently:
-
-
-
-\* popularity is difficult to beat consistently
-
-\* personalization metrics are relatively low
-
-\* category-based content features are limited
-
-\* ranking evaluation has a small final processed subset
-
-\* local latency benchmarks are not production capacity measurements
-
-
-
-The system is therefore presented as an \*\*end-to-end ML engineering system and architecture demonstration\*\*, not as a claim of production recommendation quality.
-
-
-
-\## Technologies
-
-
+The complete application stack is containerized.
 
 ```text
+┌─────────────────────────────────────────────┐
+│              Docker Compose                 │
+│                                             │
+│  ┌────────────┐      ┌───────────────┐     │
+│  │  FastAPI   │─────►│     Redis     │     │
+│  └─────┬──────┘      └───────────────┘     │
+│        │                                    │
+│        │             ┌───────────────┐      │
+│        └────────────►│     Kafka     │      │
+│                      └───────────────┘      │
+│                                             │
+│  ┌──────────────────┐                       │
+│  │ Feature Consumer │                       │
+│  └──────────────────┘                       │
+│                                             │
+│  ┌──────────────────┐                       │
+│  │   Prometheus     │                       │
+│  └──────────────────┘                       │
+└─────────────────────────────────────────────┘
+```
 
+Services:
+
+```text
+api
+feature-consumer
+kafka
+redis
+prometheus
+```
+
+The API image contains the trained retrieval, ranking, and category artifacts required for serving.
+
+---
+
+# 18. CI/CD
+
+GitHub Actions validates the repository on pushes and pull requests.
+
+The CI pipeline performs:
+
+```text
+Checkout
+   ↓
+Python 3.12 setup
+   ↓
+Dependency installation
+   ↓
+Python compilation
+   ↓
+Test suite
+   ↓
+Docker Compose validation
+   ↓
+API image build
+```
+
+This provides automated validation before changes are merged.
+
+---
+
+# 19. Serving Performance
+
+A 100-request concurrent benchmark was performed against the Dockerized API.
+
+Configuration:
+
+```text
+Requests:    100
+Concurrency: 10
+```
+
+Results:
+
+| Metric              |          Result |
+| ------------------- | --------------: |
+| Successful requests |   **100 / 100** |
+| Errors              |           **0** |
+| Throughput          | **75.23 req/s** |
+| p50                 |   **128.81 ms** |
+| p95                 |   **170.75 ms** |
+| p99                 |   **206.15 ms** |
+| Maximum             |   **229.15 ms** |
+
+The benchmark demonstrates successful concurrent serving under the tested local environment.
+
+These numbers are environment-specific and should not be interpreted as a cloud-production SLA.
+
+---
+
+# 20. Engineering Decisions
+
+### Temporal evaluation instead of random splitting
+
+Random recommendation splits can leak future behavior into training or candidate construction.
+
+The project uses chronological boundaries to better represent real deployment conditions.
+
+### Multi-stage retrieval and ranking
+
+Retrieval and ranking have different computational requirements.
+
+The architecture therefore separates:
+
+```text
+Candidate Generation
+        ↓
+Ranking
+        ↓
+Personalization
+        ↓
+Diversification
+```
+
+### HNSW instead of exhaustive retrieval
+
+Exact similarity search provides a useful correctness baseline, while HNSW provides a lower-latency approximate retrieval path.
+
+### Redis for online state
+
+Recent behavioral features change continuously and therefore should not require offline feature regeneration for every interaction.
+
+### Category representation instead of conventional text embeddings
+
+The source dataset has limited natural-language product information. Category and attribute signals therefore provide a more defensible representation than pretending the data contains rich product descriptions.
+
+### MLflow for experiment tracking
+
+Model parameters, losses, and artifacts are tracked independently from source code to improve reproducibility.
+
+---
+
+# 21. Limitations
+
+The system is a portfolio-scale production-oriented implementation rather than a deployed commercial recommendation platform.
+
+Important limitations include:
+
+* RetailRocket is an implicit-feedback dataset.
+* The dataset does not provide rich product descriptions.
+* Offline evaluation has a limited number of positive test interactions.
+* No claim of statistical significance is made for the reported offline improvements.
+* Serving benchmarks were performed in a local Docker environment.
+* Kafka is configured as a single-node development deployment.
+* Redis is configured as a single-node deployment.
+* MLflow uses SQLite for local experiment tracking.
+* The system does not claim online A/B-test results because it has not been deployed to real users.
+
+---
+
+# 22. Technology Stack
+
+### Machine Learning
+
+```text
 Python
-
 PyTorch
-
-NumPy
-
-Pandas
-
-Scikit-learn
-
-SciPy
-
-FAISS
-
-HNSW
-
 LightGBM
-
-FastAPI
-
-Uvicorn
-
-Docker
-
+scikit-learn
+SciPy
+NumPy
+Pandas
 ```
 
-
-
-\## Core Takeaway
-
-
-
-This project demonstrates a complete recommendation serving architecture rather than a single recommendation model:
-
-
+### Retrieval
 
 ```text
-
-Implicit Feedback
-
-&#x20;      ↓
-
-Candidate Retrieval
-
-&#x20;      ↓
-
-Two-Tower Embeddings
-
-&#x20;      ↓
-
-HNSW ANN Search
-
-&#x20;      ↓
-
-Feature Engineering
-
-&#x20;      ↓
-
-LightGBM Learning-to-Rank
-
-&#x20;      ↓
-
-MMR Diversification
-
-&#x20;      ↓
-
-Cold-Start Fallback
-
-&#x20;      ↓
-
-FastAPI
-
-&#x20;      ↓
-
-Docker
-
+FAISS
+Two-Tower Retrieval
+HNSW
+BM25
+Reciprocal Rank Fusion
 ```
 
+### Personalization
 
+```text
+Session Affinity
+Category Affinity
+MMR Diversification
+```
 
-The emphasis is on \*\*retrieval architecture, ranking, evaluation discipline, latency engineering, serving, and reproducibility\*\*.
+### Data / Streaming
 
+```text
+Kafka
+Redis
+```
 
+### Serving
 
+```text
+FastAPI
+Uvicorn
+```
+
+### MLOps / Observability
+
+```text
+MLflow
+Prometheus
+GitHub Actions
+Docker
+Docker Compose
+```
+
+---
+
+# 23. Repository Structure
+
+```text
+personalization-ranking-engine/
+│
+├── data/
+│   ├── processed/
+│   └── features/
+│
+├── models/
+│   ├── two_tower.pt
+│   ├── two_tower_items_hnsw.faiss
+│   ├── lightgbm_ranker.txt
+│   ├── popularity.csv
+│   ├── bm25_index.pkl
+│   └── item_category_embedding_temporal.npy
+│
+├── src/
+│   ├── api/
+│   │   ├── app.py
+│   │   └── metrics.py
+│   │
+│   ├── evaluation/
+│   │
+│   ├── features/
+│   │
+│   ├── models/
+│   │   └── two_tower.py
+│   │
+│   ├── pipeline/
+│   │   └── recommend.py
+│   │
+│   ├── retrieval/
+│   │   └── bm25.py
+│   │
+│   └── streaming/
+│       ├── producer.py
+│       ├── consumer.py
+│       ├── feature_consumer.py
+│       └── online_features.py
+│
+├── infra/
+│   └── prometheus/
+│       └── prometheus.yml
+│
+├── tests/
+│
+├── Dockerfile
+├── compose.yaml
+├── requirements.txt
+└── .github/
+    └── workflows/
+        └── ci.yml
+```
+
+---
+
+# 24. End-to-End Data Flow
+
+The complete system can be summarized as:
+
+```text
+                 USER INTERACTION
+                       │
+                       ▼
+                    Kafka
+                       │
+                       ▼
+              Online Feature Consumer
+                       │
+                       ▼
+                    Redis
+                       │
+                       │
+                       ▼
+                  FastAPI API
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+   User / Session State       Query / Context
+          │                         │
+          └────────────┬────────────┘
+                       ▼
+                Candidate Retrieval
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+        Two-Tower/HNSW          BM25
+             │                   │
+             └─────────┬─────────┘
+                       ▼
+                     RRF
+                       │
+                       ▼
+              LightGBM LambdaRank
+                       │
+                       ▼
+             Personalization Layer
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+       Category Affinity   Session Affinity
+              │                 │
+              └────────┬────────┘
+                       ▼
+                  MMR Diversity
+                       │
+                       ▼
+                    Top-N
+                       │
+                       ▼
+                 API Response
+```
+
+---
+
+# 25. Project Outcome
+
+This project demonstrates the implementation of a complete recommendation system beyond a standalone ML model.
+
+The system covers:
+
+```text
+Data
+ ↓
+Temporal Evaluation
+ ↓
+Retrieval
+ ↓
+Approximate Nearest Neighbor Search
+ ↓
+Hybrid Search
+ ↓
+Learning-to-Rank
+ ↓
+Real-Time Features
+ ↓
+Personalization
+ ↓
+Diversification
+ ↓
+API Serving
+ ↓
+Observability
+ ↓
+Experiment Tracking
+ ↓
+Containerization
+ ↓
+CI/CD
+```
+
+The primary engineering objective was to build a recommendation platform where **retrieval quality, ranking quality, real-time behavior, serving performance, and operational infrastructure are treated as one system rather than isolated ML experiments**.
