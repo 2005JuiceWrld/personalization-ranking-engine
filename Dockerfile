@@ -19,6 +19,10 @@ COPY models/two_tower_item_mapping.csv ./models/two_tower_item_mapping.csv
 COPY models/two_tower_items_hnsw.faiss ./models/two_tower_items_hnsw.faiss
 COPY models/lightgbm_ranker.txt ./models/lightgbm_ranker.txt
 COPY models/popularity.csv ./models/popularity.csv
+COPY models/item_category_embedding_temporal.npy ./models/item_category_embedding_temporal.npy
+COPY models/item_category_svd_temporal.joblib ./models/item_category_svd_temporal.joblib
+COPY models/item_category_vocabulary_temporal.csv ./models/item_category_vocabulary_temporal.csv
+COPY models/bm25_index.pkl ./models/bm25_index.pkl
 
 COPY data/features ./data/features
 COPY data/processed/train.csv ./data/processed/train.csv

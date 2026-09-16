@@ -1,9 +1,13 @@
 import json
+import os
 
 from kafka import KafkaConsumer
 
 
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv(
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "localhost:9092",
+)
 KAFKA_TOPIC = "interaction-events"
 KAFKA_GROUP_ID = "personalization-event-consumer"
 
@@ -23,6 +27,7 @@ if __name__ == "__main__":
     consumer = create_consumer()
 
     print("Kafka consumer started")
+    print(f"Kafka: {KAFKA_BOOTSTRAP_SERVERS}")
     print(f"Topic: {KAFKA_TOPIC}")
     print(f"Group: {KAFKA_GROUP_ID}")
     print("Waiting for events...")

@@ -1,15 +1,19 @@
 import json
+import os
 
 import redis
 from kafka import KafkaConsumer
 
 
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv(
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "localhost:9092",
+)
 KAFKA_TOPIC = "interaction-events"
 KAFKA_GROUP_ID = "personalization-feature-consumer"
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 RECENT_ITEMS_LIMIT = 20
 
@@ -82,9 +86,10 @@ if __name__ == "__main__":
     redis_client = create_redis_client()
 
     print("Kafka -> Redis feature consumer started")
-    print(f"Kafka topic: {KAFKA_TOPIC}")
-    print(f"Consumer group: {KAFKA_GROUP_ID}")
+    print(f"Kafka: {KAFKA_BOOTSTRAP_SERVERS}")
     print(f"Redis: {REDIS_HOST}:{REDIS_PORT}")
+    print(f"Topic: {KAFKA_TOPIC}")
+    print(f"Consumer group: {KAFKA_GROUP_ID}")
     print("Waiting for events...")
 
     try:
